@@ -119,11 +119,11 @@ async def healthcheck():
 
 @app.get("/transcript/{video_id}")
 async def get_transcript(
+    request: Request,
     video_id: str,
     lang: Optional[str] = Query(None, description="Idioma preferencial (ex: pt-BR, pt, en)"),
     format: str = Query("json", description="Formato de resposta: 'text' ou 'json'"),
-    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
-    request: Request
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ):
     """
     Obtém transcrição de um vídeo do YouTube
@@ -177,37 +177,29 @@ async def get_transcript(
     try:
         logger.info(f"Request {request_id}: Fetching transcript for video {video_id} with languages {languages}")
         
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        # Tentar obter transcrição nos idiomas preferidos
-        transcript = None
+        transcript_data = None
         language_used = None
         
-        # Tentar encontrar transcrição nos idiomas preferidos
+        # Tentar obter transcrição diretamente nos idiomas preferidos
         for preferred_lang in languages:
             try:
-                transcript = transcript_list.find_transcript([preferred_lang])
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=[preferred_lang])
                 language_used = preferred_lang
                 break
             except (NoTranscriptFound, TranscriptsDisabled):
-                # Se não encontrar no idioma, tentar traduzir
-                try:
-                    # Pegar primeiro idioma disponível e traduzir
-                    available_transcripts = list(transcript_list)
-                    if available_transcripts:
-                        transcript = available_transcripts[0].translate(preferred_lang)
-                        language_used = preferred_lang
-                        break
-                except:
-                    continue
-            except:
+                continue
+            except Exception as e:
+                logger.warning(f"Request {request_id}: Error getting transcript in {preferred_lang}: {str(e)}")
                 continue
         
-        if not transcript:
-            raise NoTranscriptFound(video_id, languages, None)
-        
-        # Obter dados da transcrição
-        transcript_data = transcript.fetch()
+        # Se não encontrou, tentar sem especificar idioma (pega qualquer disponível)
+        if not transcript_data:
+            try:
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+                language_used = "auto"
+            except Exception as e:
+                logger.warning(f"Request {request_id}: Error getting transcript without language: {str(e)}")
+                raise NoTranscriptFound(video_id, languages, None)
         
         # Montar texto completo
         full_text = " ".join([item["text"] for item in transcript_data])
@@ -288,7 +280,21 @@ async def get_transcript(
         )
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Request {request_id}: Internal error for video {video_id}: {error_msg}", exc_info=True)
+        error_type = type(e).__name__
+        
+        # Tratar erros específicos de parsing XML/HTML
+        if "no element found" in error_msg.lower() or "xml" in error_msg.lower():
+            logger.error(f"Request {request_id}: XML parsing error for video {video_id}: {error_msg}")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "no_transcript",
+                    "message": "Não foi possível obter a transcrição. O vídeo pode não ter legendas disponíveis.",
+                    "request_id": request_id
+                }
+            )
+        
+        logger.error(f"Request {request_id}: Internal error for video {video_id} ({error_type}): {error_msg}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail={
